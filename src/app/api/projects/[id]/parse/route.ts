@@ -7,8 +7,6 @@ import { parseAndChunkPDF } from '@/lib/pdf/simple-parser'
 const EMBED_BATCH_SIZE = 20
 const EMBED_BATCH_DELAY_MS = 100
 
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
-
 async function sleep(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
@@ -17,6 +15,7 @@ export async function POST(
   request: Request,
   { params }: { params: Promise<{ id: string }> }
 ) {
+  const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
   const { id: projectId } = await params
   const supabase = await createClient()
   const serviceClient = createServiceClient()

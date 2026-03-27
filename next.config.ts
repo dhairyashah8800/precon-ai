@@ -1,7 +1,13 @@
-import type { NextConfig } from "next";
+import type { NextConfig } from 'next'
 
 const nextConfig: NextConfig = {
-  /* config options here */
-};
+  serverExternalPackages: ['pdf-parse'],
+  experimental: {
+    serverActions: {
+      bodySizeLimit: '150mb',
+    },
+  },
+  middlewareClientMaxBodySize: '150mb',
+}
 
-export default nextConfig;
+export default nextConfig

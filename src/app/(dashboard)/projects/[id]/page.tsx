@@ -43,8 +43,8 @@ const MODULES = [
     title: 'AI Q&A',
     description: 'Ask questions grounded in your project specs',
     icon: MessageSquare,
-    href: () => '#',
-    available: false,
+    href: (id: string) => `/projects/${id}/ask`,
+    available: true,
   },
   {
     id: 'rfis',

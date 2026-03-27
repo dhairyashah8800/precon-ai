@@ -94,19 +94,34 @@ export async function POST(
     )
   }
 
-  // Step 2: Embed the question
-  const embeddingResponse = await openai.embeddings.create({
-    model: 'text-embedding-3-small',
-    input: question.trim(),
+  // Step 2: HyDE — generate a hypothetical spec excerpt, then embed it.
+  // This closes the semantic gap between natural-language questions and spec prose.
+  const hydeResponse = await anthropic.messages.create({
+    model: 'claude-haiku-4-5-20251001',
+    max_tokens: 256,
+    temperature: 0,
+    system: 'You are a construction specification writer. Given a question, write a short realistic excerpt (2-4 sentences) from a government construction spec book that would answer it. Use formal spec language and proper technical terminology. Output only the excerpt — no preamble.',
+    messages: [{ role: 'user', content: question.trim() }],
   })
-  const questionEmbedding = embeddingResponse.data[0].embedding
+  const hydeExcerpt =
+    hydeResponse.content[0].type === 'text' ? hydeResponse.content[0].text : question.trim()
+
+  // Embed both the original question and the HyDE excerpt, average the vectors
+  const [questionEmbed, hydeEmbed] = await Promise.all([
+    openai.embeddings.create({ model: 'text-embedding-3-small', input: question.trim() }),
+    openai.embeddings.create({ model: 'text-embedding-3-small', input: hydeExcerpt }),
+  ])
+  const qVec = questionEmbed.data[0].embedding
+  const hVec = hydeEmbed.data[0].embedding
+  // Averaged embedding captures both the question intent and expected spec phrasing
+  const questionEmbedding = qVec.map((v, i) => (v + hVec[i]) / 2)
 
   // Step 3: Vector search via service client (bypasses RLS, filtered by project_id)
   const { data: chunks, error: searchError } = await serviceClient.rpc('match_chunks_simple', {
     query_embedding: questionEmbedding,
     match_project_id: projectId,
-    match_count: 15,
-    match_threshold: 0.3,
+    match_count: 25,
+    match_threshold: 0.25,
   }) as { data: ChunkResult[] | null; error: unknown }
 
   if (searchError) {

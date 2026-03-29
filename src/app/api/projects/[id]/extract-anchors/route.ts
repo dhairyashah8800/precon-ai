@@ -5,6 +5,8 @@ import { extractPagesText, extractAnchors } from '@/lib/pdf/anchor-extractor'
 import { matchAnchors, calculateBoundaries, calculatePageOffset } from '@/lib/pdf/anchor-matcher'
 import type { TocAnchor } from '@/lib/pdf/anchor-extractor'
 
+export const maxDuration = 300
+
 export async function POST(
   request: Request,
   { params }: { params: Promise<{ id: string }> }

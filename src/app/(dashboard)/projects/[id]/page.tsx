@@ -18,6 +18,7 @@ import {
   CardTitle,
   CardDescription,
 } from '@/components/ui/card'
+import { DeleteProjectButton } from './DeleteProjectButton'
 
 type Agency = 'DDC' | 'DEP' | 'DOT' | 'SCA' | 'Private'
 
@@ -132,9 +133,12 @@ export default async function ProjectPage({ params }: { params: Promise<{ id: st
               <p className="text-sm text-muted-foreground mt-1">Bid Date: {bidDateFormatted}</p>
             )}
           </div>
-          <Badge variant="secondary" className="capitalize mt-1">
-            {project.status}
-          </Badge>
+          <div className="flex items-center gap-3 mt-1">
+            <Badge variant="secondary" className="capitalize">
+              {project.status}
+            </Badge>
+            <DeleteProjectButton projectId={project.id} projectName={project.name} />
+          </div>
         </div>
       </div>
 

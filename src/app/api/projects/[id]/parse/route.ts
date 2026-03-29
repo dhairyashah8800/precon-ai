@@ -2,14 +2,9 @@ import { NextResponse } from 'next/server'
 import OpenAI from 'openai'
 import { createClient } from '@/lib/supabase/server'
 import { createServiceClient } from '@/lib/supabase/service'
-import { parseAndChunkPDF } from '@/lib/pdf/simple-parser'
-
-const EMBED_BATCH_SIZE = 20
-const EMBED_BATCH_DELAY_MS = 100
-
-async function sleep(ms: number) {
-  return new Promise((resolve) => setTimeout(resolve, ms))
-}
+import { extractPagesText, extractAnchors } from '@/lib/pdf/anchor-extractor'
+import { matchAnchors, calculateBoundaries, calculatePageOffset } from '@/lib/pdf/anchor-matcher'
+import { contextualChunk } from '@/lib/pdf/contextual-chunker'
 
 export async function POST(
   request: Request,
@@ -41,7 +36,7 @@ export async function POST(
   // Fetch + authorize document
   const { data: document, error: docError } = await supabase
     .from('documents')
-    .select('id, project_id, org_id, file_path, doc_type')
+    .select('id, project_id, org_id, file_path, file_name, doc_type')
     .eq('id', body.document_id)
     .eq('project_id', projectId)
     .eq('org_id', userProfile.org_id)
@@ -50,97 +45,176 @@ export async function POST(
   if (docError || !document) {
     return NextResponse.json({ error: 'Document not found' }, { status: 404 })
   }
-  // Clean up any chunks from a previous failed attempt before re-parsing
-  await serviceClient.from('chunks').delete()
-    .eq('project_id', projectId)
-    .eq('document_id', document.id)
 
-  // Download PDF via service role (bypasses RLS for large file access)
-  console.log(`[parse] Downloading ${document.file_path}`)
-  const { data: fileBlob, error: storageError } = await serviceClient.storage
-    .from('project-files')
-    .download(document.file_path)
-
-  if (storageError || !fileBlob) {
-    return NextResponse.json(
-      { error: `Failed to download PDF: ${storageError?.message ?? 'unknown'}` },
-      { status: 500 }
-    )
-  }
-
-  const pdfBuffer = Buffer.from(await fileBlob.arrayBuffer())
-  console.log(`[parse] PDF downloaded (${(pdfBuffer.length / 1024 / 1024).toFixed(1)} MB)`)
-
-  // Extract + chunk
-  let chunks: Awaited<ReturnType<typeof parseAndChunkPDF>>
   try {
-    chunks = await parseAndChunkPDF(pdfBuffer)
-  } catch (err) {
-    return NextResponse.json(
-      { error: `PDF parsing failed: ${err instanceof Error ? err.message : String(err)}` },
-      { status: 500 }
-    )
-  }
-  console.log(`[parse] Extracted ${chunks.length} chunks`)
+    // Download PDF via service role
+    console.log(`[parse] Downloading PDF: ${document.file_name ?? document.file_path}`)
+    const { data: fileBlob, error: storageError } = await serviceClient.storage
+      .from('project-files')
+      .download(document.file_path)
 
-  // Embed in batches, collect results
-  const embeddings: number[][] = []
-  for (let i = 0; i < chunks.length; i += EMBED_BATCH_SIZE) {
-    const batch = chunks.slice(i, i + EMBED_BATCH_SIZE)
-    console.log(`[parse] Embedding batch ${Math.floor(i / EMBED_BATCH_SIZE) + 1}/${Math.ceil(chunks.length / EMBED_BATCH_SIZE)}`)
-
-    const response = await openai.embeddings.create({
-      model: 'text-embedding-3-small',
-      input: batch.map((c) => c.content),
-    })
-
-    embeddings.push(...response.data.map((d) => d.embedding))
-
-    if (i + EMBED_BATCH_SIZE < chunks.length) {
-      await sleep(EMBED_BATCH_DELAY_MS)
+    if (storageError || !fileBlob) {
+      return NextResponse.json(
+        { error: `Failed to download PDF: ${storageError?.message ?? 'unknown'}` },
+        { status: 500 }
+      )
     }
-  }
 
-  // Insert chunks — on any failure, roll back by deleting what we inserted
-  const insertedIds: string[] = []
-  try {
-    for (let i = 0; i < chunks.length; i++) {
-      const chunk = chunks[i]
-      const { data: row, error: insertError } = await serviceClient
-        .from('chunks')
-        .insert({
+    const buffer = Buffer.from(await fileBlob.arrayBuffer())
+    console.log(`[parse] PDF downloaded (${(buffer.length / 1024 / 1024).toFixed(1)} MB)`)
+
+    // Extract ALL pages text
+    console.log(`[parse] Extracting text from all pages...`)
+    const allPages = await extractPagesText(buffer, 1, 9999)
+    console.log(`[parse] Extracted text from ${allPages.length} pages`)
+
+    // Pass 0.1: Anchor extraction (first 50 pages → Claude)
+    console.log(`[parse] Pass 0.1: Extracting TOC anchors via Claude...`)
+    const tocPages = allPages.filter((p) => p.pageNumber <= 50)
+    const anchors = await extractAnchors(tocPages)
+    console.log(`[parse] Found ${anchors.length} anchors`)
+
+    // Pass 0.2: Anchor matching + TOC fallback
+    console.log(`[parse] Pass 0.2: Matching anchors to PDF pages...`)
+    const { matched, unmatched } = matchAnchors(anchors, allPages)
+    const offset = calculatePageOffset(matched)
+    const boundaries = calculateBoundaries(matched, unmatched, offset, allPages.length)
+    const unmatchedAnchors = unmatched.map((a) => a.title)
+    console.log(
+      `[parse] Matched ${matched.length}/${anchors.length} anchors → ${boundaries.length} sections (${unmatched.length} used TOC fallback)`
+    )
+
+    // Look up project code for contextual headers
+    const { data: project } = await serviceClient
+      .from('projects')
+      .select('code')
+      .eq('id', projectId)
+      .single()
+    const projectCode = (project as { code?: string } | null)?.code ?? 'UNKNOWN'
+
+    // Pass 2: Contextual chunking
+    console.log(`[parse] Pass 2: Contextual chunking...`)
+    const chunks = contextualChunk(boundaries, allPages, projectCode, document.id)
+    console.log(`[parse] Generated ${chunks.length} contextual chunks`)
+
+    // Cleanup previous parse data
+    console.log(`[parse] Cleaning up previous parse data...`)
+    await serviceClient.from('chunks').delete().eq('document_id', document.id)
+    await serviceClient.from('spec_sections').delete().eq('document_id', document.id)
+
+    // Insert spec_sections
+    console.log(`[parse] Inserting ${boundaries.length} spec sections...`)
+    for (let i = 0; i < boundaries.length; i++) {
+      const boundary = boundaries[i]
+      const sectionText = allPages
+        .filter((p) => p.pageNumber >= boundary.startPage && p.pageNumber <= boundary.endPage)
+        .map((p) => p.text)
+        .join('\n')
+
+      const insertPayload = {
+        document_id: document.id,
+        project_id: projectId,
+        org_id: document.org_id,
+        division: boundary.division,               // always non-null: '00' for admin
+        section_number: boundary.sectionNumber ?? 'unknown',
+        title: boundary.title,
+        raw_text: sectionText.substring(0, 100000),
+        page_start: boundary.startPage,
+        page_end: boundary.endPage,
+      }
+
+      if (i === 0) {
+        console.log(`[parse] First spec_section insert payload:`, JSON.stringify(insertPayload, null, 2))
+      }
+
+      const { error: sectionError } = await serviceClient.from('spec_sections').insert(insertPayload)
+      if (sectionError) {
+        console.error(`[parse] spec_sections insert failed for "${boundary.title}":`, sectionError)
+      }
+    }
+
+    // Embed chunks in batches of 20
+    console.log(`[parse] Embedding ${chunks.length} chunks...`)
+    const BATCH_SIZE = 20
+    const embeddedChunks: {
+      content: string
+      embedding: number[]
+      metadata: object
+      org_id: string
+      project_id: string
+      document_id: string
+    }[] = []
+
+    for (let i = 0; i < chunks.length; i += BATCH_SIZE) {
+      const batch = chunks.slice(i, i + BATCH_SIZE)
+      console.log(
+        `[parse] Embedding batch ${Math.floor(i / BATCH_SIZE) + 1}/${Math.ceil(chunks.length / BATCH_SIZE)}`
+      )
+
+      const response = await openai.embeddings.create({
+        model: 'text-embedding-3-small',
+        input: batch.map((c) => c.content), // embed WITH contextual header
+      })
+
+      for (let j = 0; j < batch.length; j++) {
+        embeddedChunks.push({
+          content: batch[j].rawContent, // store WITHOUT header for display
+          embedding: response.data[j].embedding,
+          metadata: batch[j].metadata,
+          org_id: document.org_id,
           project_id: projectId,
           document_id: document.id,
-          org_id: document.org_id,
-          content: chunk.content,
-          embedding: embeddings[i],
-          metadata: chunk.metadata,
         })
-        .select('id')
-        .single()
-
-      if (insertError) {
-        throw new Error(`Chunk ${i} insert failed: ${insertError.message}`)
       }
-      insertedIds.push(row.id)
+
+      await new Promise((r) => setTimeout(r, 100))
     }
+
+    // Insert chunks in batches of 50
+    console.log(`[parse] Storing ${embeddedChunks.length} chunks in database...`)
+    for (let i = 0; i < embeddedChunks.length; i += 50) {
+      const batch = embeddedChunks.slice(i, i + 50)
+      const { error: insertError } = await serviceClient.from('chunks').insert(
+        batch.map((c) => ({
+          org_id: document.org_id,
+          project_id: c.project_id,
+          document_id: c.document_id,
+          content: c.content,
+          embedding: JSON.stringify(c.embedding),
+          metadata: c.metadata,
+        }))
+      )
+      if (insertError) {
+        console.error(`[parse] Chunk insert error at batch ${i}:`, insertError)
+        await serviceClient.from('chunks').delete().eq('document_id', document.id)
+        await serviceClient.from('spec_sections').delete().eq('document_id', document.id)
+        return NextResponse.json(
+          { error: `Failed to store chunks: ${insertError.message}` },
+          { status: 500 }
+        )
+      }
+    }
+
+    // Mark document as parsed
+    await serviceClient.from('documents').update({ parsed: true }).eq('id', document.id)
+
+    console.log(
+      `[parse] Complete: ${boundaries.length} sections, ${embeddedChunks.length} chunks`
+    )
+
+    return NextResponse.json({
+      sections_found: boundaries.length,
+      chunks_created: embeddedChunks.length,
+      anchors_total: anchors.length,
+      anchors_matched: matched.length,
+      anchors_unmatched: unmatchedAnchors,
+      page_offset: offset,
+    })
   } catch (err) {
-    // Roll back partial inserts
-    if (insertedIds.length > 0) {
-      await serviceClient.from('chunks').delete().in('id', insertedIds)
-    }
+    console.error('[parse] Unhandled error:', err)
     return NextResponse.json(
-      { error: `Failed to store chunks: ${err instanceof Error ? err.message : String(err)}` },
+      { error: err instanceof Error ? err.message : String(err) },
       { status: 500 }
     )
   }
-
-  // Mark document as parsed
-  await supabase
-    .from('documents')
-    .update({ parsed: true })
-    .eq('id', document.id)
-
-  console.log(`[parse] Done — ${chunks.length} chunks stored`)
-  return NextResponse.json({ chunks_created: chunks.length })
 }

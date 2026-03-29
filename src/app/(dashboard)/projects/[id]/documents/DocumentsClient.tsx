@@ -46,6 +46,7 @@ type UploadFile = {
 
 type ParseState = {
   status: 'idle' | 'parsing' | 'done' | 'error'
+  sections_found?: number
   chunks_created?: number
   error?: string
 }
@@ -227,7 +228,11 @@ export function DocumentsClient({
         body: JSON.stringify({ document_id: doc.id }),
       })
 
-      const data = (await res.json()) as { chunks_created?: number; error?: string }
+      const data = (await res.json()) as {
+        sections_found?: number
+        chunks_created?: number
+        error?: string
+      }
 
       if (!res.ok) {
         setParseStates((prev) => ({
@@ -242,7 +247,11 @@ export function DocumentsClient({
       )
       setParseStates((prev) => ({
         ...prev,
-        [doc.id]: { status: 'done', chunks_created: data.chunks_created },
+        [doc.id]: {
+          status: 'done',
+          sections_found: data.sections_found,
+          chunks_created: data.chunks_created,
+        },
       }))
     } catch {
       setParseStates((prev) => ({
@@ -400,6 +409,7 @@ export function DocumentsClient({
               const parseState = parseStates[doc.id]
               const isParsing = parseState?.status === 'parsing'
               const parseError = parseState?.status === 'error' ? parseState.error : undefined
+              const sectionsDone = parseState?.status === 'done' ? parseState.sections_found : undefined
               const chunksDone = parseState?.status === 'done' ? parseState.chunks_created : undefined
 
               return (
@@ -417,7 +427,7 @@ export function DocumentsClient({
                     </p>
                     {isParsing && (
                       <p className="text-xs text-muted-foreground mt-0.5 animate-pulse">
-                        Parsing… this may take a few minutes for large files
+                        Parsing… this may take several minutes for large spec books
                       </p>
                     )}
                     {parseError && (
@@ -431,7 +441,9 @@ export function DocumentsClient({
                     {doc.parsed ? (
                       <Badge className="text-xs gap-1">
                         <CheckCircle2 className="h-3 w-3" />
-                        {chunksDone != null ? `${chunksDone} chunks` : 'Parsed'}
+                        {sectionsDone != null && chunksDone != null
+                          ? `${sectionsDone} sections · ${chunksDone} chunks`
+                          : 'Parsed'}
                       </Badge>
                     ) : (
                       <>
